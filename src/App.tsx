@@ -23,7 +23,8 @@ import {
   Check,
   X,
   Monitor,
-  AlertCircle
+  AlertCircle,
+  Key
 } from "lucide-react";
 
 interface Round {
@@ -105,6 +106,25 @@ export default function App() {
   const [showInstallModal, setShowInstallModal] = useState(false);
   const [copied, setCopied] = useState(false);
 
+  // Bring Your Own Key (BYOK) state for quota exhaustion protection
+  const [userApiKey, setUserApiKey] = useState<string>(() => {
+    try {
+      return localStorage.getItem("user_gemini_api_key") || "";
+    } catch {
+      return "";
+    }
+  });
+  const [showApiKeyModal, setShowApiKeyModal] = useState(false);
+  const [tempApiKey, setTempApiKey] = useState("");
+  const [quotaModalInputKey, setQuotaModalInputKey] = useState("");
+  const [quotaUrlCopied, setQuotaUrlCopied] = useState(false);
+  const [serverQuotaExhausted, setServerQuotaExhausted] = useState(false);
+  const [quotaAlertModal, setQuotaAlertModal] = useState<{ show: boolean; message: string; details: string }>({
+    show: false,
+    message: "",
+    details: ""
+  });
+
   // 영구 독립 접속 주소 (Google AI Studio 로그인 없이 24시간 언제든 접속 가능한 Shared App URL)
   const getPermanentAppUrl = () => {
     if (typeof window !== "undefined") {
@@ -114,6 +134,14 @@ export default function App() {
       return window.location.origin;
     }
     return "https://ais-pre-jmdd6gdofyxi57cxkhdh73-324830255896.asia-northeast1.run.app";
+  };
+
+  const copyApiKeyPageUrl = () => {
+    try {
+      navigator.clipboard.writeText("https://aistudio.google.com/app/apikey");
+      setQuotaUrlCopied(true);
+      setTimeout(() => setQuotaUrlCopied(false), 2000);
+    } catch {}
   };
 
   useEffect(() => {
@@ -187,32 +215,84 @@ export default function App() {
   const fetchHistory = async () => {
     try {
       const res = await fetch("/api/debates");
-      const data = await res.json();
-      setHistory(data);
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data)) {
+          setHistory(data);
+          try {
+            localStorage.setItem("ai_debates_history", JSON.stringify(data));
+          } catch (e) {}
+          return;
+        }
+      }
     } catch (err) {
-      console.error("Failed to fetch history", err);
+      console.warn("Server history fetch issue, reading local cache", err);
     }
+    try {
+      const cached = localStorage.getItem("ai_debates_history");
+      if (cached) setHistory(JSON.parse(cached));
+    } catch (e) {}
   };
 
-  const startDebate = async () => {
-    if (!topic || personas.some(p => !p)) return;
+  const startDebate = async (overrideKey?: string) => {
+    if (!topic || personas.some(p => !p.trim())) return;
+
+    const activeKey = (overrideKey !== undefined ? overrideKey : userApiKey).trim();
+
+    // 사용하기 전 이미 할당량이 소모된 상태이고 개인 키가 없다면 친절 안내 팝업을 바로 띄움
+    if (serverQuotaExhausted && !activeKey) {
+      setQuotaModalInputKey("");
+      setQuotaAlertModal({
+        show: true,
+        message: "하루 할당량이 다 소모되었습니다. 개인 API키를 입력해주세요",
+        details: "오늘 기본 제공되는 무료 API의 하루 할당량이 모두 소모되었습니다. 구글 AI Studio에서 무료로 발급받을 수 있는 개인 API 키를 등록해주세요."
+      });
+      return;
+    }
+
     setIsGenerating(true);
     setView("result");
     setCurrentDebate(null);
     setVisibleRoundsCount(0);
 
     try {
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (activeKey) {
+        headers["x-gemini-api-key"] = activeKey;
+      }
+
       const res = await fetch("/api/debate/generate", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ topic, personas }),
+        headers,
+        body: JSON.stringify({ 
+          topic, 
+          personas,
+          customApiKey: activeKey || undefined
+        }),
       });
+
       const data = await res.json();
-      if (data.error) throw new Error(data.error);
+
+      if (!res.ok || data.error) {
+        if (res.status === 429 || data.isQuotaExhausted) {
+          setServerQuotaExhausted(true);
+          setQuotaModalInputKey(activeKey);
+          setQuotaAlertModal({
+            show: true,
+            message: data.error || "하루 할당량이 다 소모되었습니다. 개인 API키를 입력해주세요",
+            details: data.details || "오늘 기본 제공되는 무료 API의 하루 할당량이 모두 소모되었습니다. 개인 무료 구글 Gemini API 키를 등록하시면 대기 없이 즉시 토론을 계속 이용하실 수 있습니다."
+          });
+          setView("new");
+          return;
+        }
+        throw new Error(data.error || "토론 생성 중 오류가 발생했습니다.");
+      }
+
+      setServerQuotaExhausted(false);
       setCurrentDebate(data);
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
-      alert("토론 생성 중 오류가 발생했습니다.");
+      alert(err.message || "토론 생성 중 오류가 발생했습니다.");
       setView("new");
     } finally {
       setIsGenerating(false);
@@ -221,36 +301,50 @@ export default function App() {
 
   const saveDebate = async () => {
     if (!currentDebate) return;
+    let serverOk = false;
     try {
       const res = await fetch("/api/debates", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(currentDebate),
       });
-      if (res.ok) {
-        fetchHistory();
-        alert("토론 내용이 아카이브에 저장되었습니다.");
-      }
+      if (res.ok) serverOk = true;
     } catch (err) {
-      console.error(err);
+      console.warn("Server save fallback to local storage:", err);
     }
+
+    try {
+      const cached = JSON.parse(localStorage.getItem("ai_debates_history") || "[]");
+      const updated = [currentDebate, ...cached.filter((d: any) => d.id !== currentDebate.id)];
+      localStorage.setItem("ai_debates_history", JSON.stringify(updated));
+      setHistory(updated);
+    } catch (e) {}
+
+    if (serverOk) {
+      fetchHistory();
+    }
+    alert("토론 내용이 아카이브에 성공적으로 저장되었습니다.");
   };
 
   const deleteDebate = async (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
     if (!confirm("정말 이 토론 기록을 삭제하시겠습니까?")) return;
     try {
-      const res = await fetch(`/api/debates/${id}`, { method: "DELETE" });
-      if (res.ok) {
-        fetchHistory();
-        if (currentDebate?.id === id) {
-          setCurrentDebate(null);
-          setView("new");
-        }
-      }
+      await fetch(`/api/debates/${id}`, { method: "DELETE" });
     } catch (err) {
-      console.error(err);
+      console.warn("Server delete issue, updating local cache:", err);
     }
+
+    try {
+      const cached = JSON.parse(localStorage.getItem("ai_debates_history") || "[]");
+      const updated = cached.filter((d: any) => d.id !== id);
+      localStorage.setItem("ai_debates_history", JSON.stringify(updated));
+      setHistory(updated);
+      if (currentDebate?.id === id) {
+        setCurrentDebate(null);
+        setView("new");
+      }
+    } catch (e) {}
   };
 
   const selectHistory = (debate: DebateResult) => {
@@ -283,7 +377,19 @@ export default function App() {
             <span className="text-[10px] text-neutral-400 uppercase tracking-[0.25em] font-bold mt-1 block">AI Debate</span>
           </div>
         </div>
-        <div className="flex items-center gap-2.5">
+        <div className="flex items-center gap-2 sm:gap-2.5">
+          <button 
+            onClick={() => { setTempApiKey(userApiKey); setShowApiKeyModal(true); }}
+            className={`flex items-center gap-1.5 px-3.5 py-2.5 rounded-2xl text-xs font-bold transition-all shadow-sm cursor-pointer hover:translate-y-[-2px] active:translate-y-[0px] ${
+              userApiKey 
+                ? 'bg-emerald-50 border border-emerald-300 text-emerald-700 hover:bg-emerald-100' 
+                : 'bg-white border border-neutral-200 hover:border-indigo-300 text-neutral-600 hover:bg-neutral-50'
+            }`}
+            title="Gemini API 키 관리"
+          >
+            <Key size={14} className={userApiKey ? "text-emerald-600" : "text-neutral-500"} />
+            <span className="hidden sm:inline">{userApiKey ? "개인 키 연결됨" : "API 설정"}</span>
+          </button>
           <button 
             onClick={handleInstallClick}
             className="flex items-center gap-2 bg-gradient-to-r from-indigo-600 via-violet-600 to-indigo-600 hover:opacity-95 text-white px-4 py-2.5 rounded-2xl text-xs font-bold shadow-lg shadow-indigo-500/25 hover:shadow-indigo-500/40 hover:translate-y-[-2px] active:translate-y-[0px] transition-all cursor-pointer"
@@ -357,19 +463,54 @@ export default function App() {
                 </div>
 
                 <div className="space-y-6">
-                  <div className="flex justify-between items-center">
-                    <label className="text-[11px] uppercase font-black tracking-[0.3em] text-neutral-400 flex items-center gap-2.5 ml-1">
-                      <div className="w-2 h-2 bg-indigo-500 rounded-full" />
-                      참여자 설정 (최대 4명)
-                    </label>
+                  <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-2">
+                    <div>
+                      <label className="text-[11px] uppercase font-black tracking-[0.3em] text-neutral-400 flex items-center gap-2.5 ml-1">
+                        <div className="w-2 h-2 bg-indigo-500 rounded-full" />
+                        참여자 성향 설정 (최대 4명)
+                      </label>
+                      <p className="text-neutral-400 text-[11px] font-medium ml-1 mt-1">
+                        각 참가자의 성향, 가치관, 직업을 적어주시면 AI가 해당 입장의 뉴스·논문·실제 사례를 취합해 토론합니다.
+                      </p>
+                    </div>
                     {personas.length < 4 && (
                       <button 
                         onClick={addPersona}
-                        className="text-xs font-bold text-indigo-600 hover:text-indigo-700 flex items-center gap-1.5 transition-colors bg-indigo-50 px-3 py-1.5 rounded-xl"
+                        className="text-xs font-bold text-indigo-600 hover:text-indigo-700 flex items-center gap-1.5 transition-colors bg-indigo-50 px-3.5 py-1.5 rounded-xl cursor-pointer self-start sm:self-auto shrink-0"
                       >
                         <Plus size={14} /> 토론자 추가
                       </button>
                     )}
+                  </div>
+
+                  {/* 성향 프리셋 칩 */}
+                  <div className="space-y-2 pt-1">
+                    <span className="text-[10px] font-bold text-neutral-400 uppercase tracking-wider block">추천 성향 태그 (클릭하여 토론자로 추가)</span>
+                    <div className="flex flex-wrap gap-2">
+                      {[
+                        "실증 데이터·통계 중심 경제학자",
+                        "헌법·법치주의 엄격 해석 법률가",
+                        "기술 혁신·규제 완화 실용주의자",
+                        "환경·기후 정의 및 생태 활동가",
+                        "의료 공공성 및 생명윤리 보건학자",
+                        "노동 인권 및 사회안전망 대변인"
+                      ].map((preset, pIdx) => (
+                        <button
+                          key={pIdx}
+                          type="button"
+                          onClick={() => {
+                            if (personas.length < 4) {
+                              setPersonas([...personas, preset]);
+                            } else {
+                              updatePersona(personas.length - 1, preset);
+                            }
+                          }}
+                          className="text-[11px] font-medium bg-neutral-100 hover:bg-indigo-50 hover:text-indigo-600 hover:border-indigo-200 border border-transparent px-3 py-1.5 rounded-xl transition-all cursor-pointer text-neutral-600"
+                        >
+                          + {preset}
+                        </button>
+                      ))}
+                    </div>
                   </div>
                   
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -394,7 +535,7 @@ export default function App() {
                         >
                           <div className="flex justify-between items-center mb-1">
                             <label className={`text-[10px] font-black uppercase tracking-[0.2em] flex items-center gap-2 ${textClass}`}>
-                              참가자 {idx + 1}
+                              참가자 {idx + 1} 성향 및 입장
                             </label>
                             {personas.length > 2 && (
                               <button onClick={() => removePersona(idx)} className="text-neutral-300 hover:text-rose-500 transition-colors">
@@ -406,6 +547,7 @@ export default function App() {
                             value={p}
                             onChange={(e) => updatePersona(idx, e.target.value)}
                             rows={3}
+                            placeholder="예: 실증 통계와 경제적 파급효과를 중시하는 거시경제학자"
                             className="w-full bg-transparent text-sm font-bold border-none outline-none resize-none placeholder:text-neutral-300 text-neutral-700 leading-normal"
                           />
                         </motion.div>
@@ -414,16 +556,79 @@ export default function App() {
                   </div>
                 </div>
 
+                {/* 하루 할당량 소모 시 사전 안내 배너 */}
+                {serverQuotaExhausted && !userApiKey && (
+                  <motion.div 
+                    initial={{ opacity: 0, y: -6 }} 
+                    animate={{ opacity: 1, y: 0 }}
+                    className="p-4 sm:p-5 bg-gradient-to-r from-amber-50 to-rose-50 border border-amber-200/80 rounded-3xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-sm"
+                  >
+                    <div className="flex items-center gap-3">
+                      <div className="w-9 h-9 rounded-2xl bg-amber-100 flex items-center justify-center text-amber-700 shrink-0">
+                        <AlertCircle size={20} />
+                      </div>
+                      <div>
+                        <div className="font-black text-rose-700 text-xs sm:text-sm">
+                          하루 할당량이 다 소모되었습니다. 개인 API키를 입력해주세요
+                        </div>
+                        <div className="text-neutral-500 text-[11px] font-medium">
+                          무료 키를 등록하시면 기다릴 필요 없이 즉시 토론을 시작하실 수 있습니다.
+                        </div>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setQuotaModalInputKey("");
+                        setQuotaAlertModal({
+                          show: true,
+                          message: "하루 할당량이 다 소모되었습니다. 개인 API키를 입력해주세요",
+                          details: "오늘 기본 제공되는 무료 API의 하루 할당량이 모두 소모되었습니다. 구글 AI Studio에서 무료로 발급받은 개인 API 키를 등록해주세요."
+                        });
+                      }}
+                      className="shrink-0 px-4 py-2.5 bg-neutral-900 hover:bg-neutral-800 text-white rounded-xl font-bold text-xs transition-colors flex items-center justify-center gap-1.5 cursor-pointer shadow-md"
+                    >
+                      <Key size={13} />
+                      <span>개인 키 입력하기</span>
+                    </button>
+                  </motion.div>
+                )}
+
                 <motion.button 
                   whileHover={{ scale: 1.01, y: -4 }}
                   whileTap={{ scale: 0.98 }}
-                  onClick={startDebate}
+                  onClick={() => startDebate()}
                   disabled={!topic || isGenerating}
                   className="w-full bg-indigo-600 hover:bg-indigo-500 disabled:opacity-30 disabled:grayscale text-white py-6 rounded-[2.5rem] text-xl font-black uppercase tracking-[0.25em] flex items-center justify-center gap-4 transition-all shadow-xl shadow-indigo-600/30"
                 >
                   {isGenerating ? <Loader2 className="animate-spin" /> : <Sword size={26} />}
                   토론 시작하기
                 </motion.button>
+
+                {/* API 키 상태 및 설정 안내 */}
+                <div className="flex flex-col sm:flex-row items-center justify-between px-3 pt-1 gap-2 text-[11px] text-neutral-400">
+                  <div className="flex items-center gap-2">
+                    <span className={`w-2 h-2 rounded-full shrink-0 ${userApiKey ? "bg-emerald-500 animate-pulse" : serverQuotaExhausted ? "bg-rose-500" : "bg-indigo-500"}`} />
+                    <span className="font-medium text-neutral-500">
+                      {userApiKey 
+                        ? `개인 API 키 적용 중 (${userApiKey.slice(0, 6)}••••${userApiKey.slice(-4)}) · 한도 제한 없음` 
+                        : serverQuotaExhausted
+                          ? "기본 공유 할당량 소진됨 · 개인 무료 키 입력 필요"
+                          : "기본 제공 무료 API로 누구나 즉시 이용 가능"}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setTempApiKey(userApiKey);
+                      setShowApiKeyModal(true);
+                    }}
+                    className="inline-flex items-center gap-1 text-indigo-600 hover:text-indigo-800 font-bold transition-colors cursor-pointer"
+                  >
+                    <Key size={12} />
+                    <span>{userApiKey ? "API 키 설정 변경" : "개인 무료 키 직접 등록"}</span>
+                  </button>
+                </div>
               </div>
             </motion.div>
           )}
@@ -575,19 +780,25 @@ export default function App() {
                     </div>
                   </div>
 
-                  <div className="lg:col-span-12 bg-white border-2 border-indigo-100 rounded-[4rem] p-12 relative overflow-hidden shadow-2xl">
-                    <div className="relative z-10 space-y-8">
-                      <div className="flex items-center gap-5 text-indigo-600">
-                        <div className="w-14 h-14 bg-indigo-600 text-white rounded-[1.25rem] flex items-center justify-center shadow-xl">
-                           <Gavel size={26} />
+                  <div className="lg:col-span-12 bg-white border-2 border-indigo-200 rounded-[3.5rem] md:rounded-[4rem] p-8 md:p-14 relative overflow-hidden shadow-2xl">
+                    <div className="relative z-10 space-y-6">
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                        <div className="flex items-center gap-4 text-indigo-600">
+                          <div className="w-14 h-14 bg-indigo-600 text-white rounded-2xl flex items-center justify-center shadow-lg shadow-indigo-200">
+                             <Gavel size={26} />
+                          </div>
+                          <div>
+                            <h4 className="font-black uppercase tracking-[0.35em] text-sm italic">Final Verdict</h4>
+                            <span className="text-xs text-indigo-600 font-black uppercase tracking-widest block mt-0.5">AI 심판관 최종 판정</span>
+                          </div>
                         </div>
-                        <div>
-                          <h4 className="font-black uppercase tracking-[0.4em] text-sm italic">Final Verdict</h4>
-                          <span className="text-xs text-indigo-500 font-black uppercase tracking-widest block mt-1">AI 심판관 최종 판정</span>
+                        <div className="inline-flex items-center gap-2 px-4 py-2 bg-gradient-to-r from-indigo-50 to-emerald-50 border border-indigo-200/80 rounded-full text-indigo-800 text-xs font-black self-start sm:self-auto shadow-sm">
+                          <Sparkles size={14} className="text-indigo-600" />
+                          100% 최적의 종합 솔루션 (Optimal Synthesis)
                         </div>
                       </div>
-                      <div className="bg-indigo-50/40 backdrop-blur-md rounded-[2.5rem] p-12 border border-white">
-                        <p className="text-neutral-800 text-xl leading-[1.8] font-bold tracking-tight whitespace-pre-wrap">
+                      <div className="bg-indigo-50/50 backdrop-blur-md rounded-[2.5rem] p-8 md:p-12 border border-indigo-100 shadow-inner">
+                        <p className="text-neutral-900 text-lg md:text-xl leading-[1.85] font-semibold tracking-tight whitespace-pre-wrap">
                           {currentDebate.verdict || "기록된 판정 결과가 없습니다."}
                         </p>
                       </div>
@@ -777,6 +988,322 @@ export default function App() {
                   className="text-xs text-neutral-400 hover:text-neutral-600 font-bold transition-colors cursor-pointer py-1"
                 >
                   닫기
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* API 키 설정 모달 (BYOK & 무료 한도 방어) */}
+      <AnimatePresence>
+        {showApiKeyModal && (
+          <motion.div 
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[100] flex items-center justify-center p-4 sm:p-6 bg-neutral-900/60 backdrop-blur-md"
+            onClick={() => setShowApiKeyModal(false)}
+          >
+            <motion.div 
+              initial={{ scale: 0.95, y: 20 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.95, y: 20 }}
+              className="bg-white rounded-[2.5rem] p-6 sm:p-9 max-w-xl w-full shadow-2xl space-y-6 relative overflow-hidden max-h-[90vh] overflow-y-auto"
+              onClick={e => e.stopPropagation()}
+            >
+              <button 
+                onClick={() => setShowApiKeyModal(false)}
+                className="absolute top-6 right-6 text-neutral-400 hover:text-neutral-900 transition-colors p-2 rounded-full hover:bg-neutral-100 cursor-pointer"
+              >
+                <X size={20} />
+              </button>
+
+              <div className="space-y-3">
+                <div className="inline-flex items-center gap-2 px-3 py-1 bg-indigo-50 rounded-full text-indigo-600 text-[11px] font-black uppercase tracking-widest">
+                  <Key size={14} /> Gemini API 설정
+                </div>
+                <h3 className="text-2xl sm:text-3xl font-black text-neutral-900 tracking-tight leading-tight">
+                  <span className="text-indigo-600">API 키</span> 관리
+                </h3>
+                <p className="text-neutral-500 text-xs sm:text-sm font-medium leading-relaxed">
+                  본 앱은 기본적으로 서버 공유 무료 API로 즉시 이용할 수 있습니다. 개인 전용 키를 등록하시면 불특정 다수의 동시 접속으로 인한 한도 제한 없이 쾌적하게 사용하실 수 있습니다.
+                </p>
+              </div>
+
+              {/* 현재 상태 뱃지 */}
+              <div className="p-4 rounded-2xl border transition-all text-xs flex items-center justify-between gap-3 bg-neutral-50 border-neutral-200">
+                <div className="flex items-center gap-2.5">
+                  <span className={`w-2.5 h-2.5 rounded-full shrink-0 ${userApiKey ? "bg-emerald-500 animate-pulse" : "bg-indigo-500"}`} />
+                  <div>
+                    <div className="font-bold text-neutral-800">
+                      {userApiKey ? "개인 전용 API 키 활성화됨" : "서버 기본 무료 키 사용 중"}
+                    </div>
+                    <div className="text-[11px] text-neutral-400">
+                      {userApiKey 
+                        ? `등록된 키: ${userApiKey.slice(0, 6)}••••••••${userApiKey.slice(-4)}`
+                        : "별도 설정 없이도 누구나 기본 토론 생성이 가능합니다."
+                      }
+                    </div>
+                  </div>
+                </div>
+                {userApiKey && (
+                  <button
+                    onClick={() => {
+                      localStorage.removeItem("user_gemini_api_key");
+                      setUserApiKey("");
+                      setTempApiKey("");
+                    }}
+                    className="shrink-0 px-2.5 py-1.5 bg-neutral-200 hover:bg-rose-100 text-neutral-600 hover:text-rose-600 rounded-xl text-[11px] font-bold transition-all cursor-pointer"
+                  >
+                    초기화
+                  </button>
+                )}
+              </div>
+
+              {/* 입력 폼 */}
+              <div className="space-y-3">
+                <label className="text-[11px] font-black uppercase tracking-widest text-neutral-400 block">
+                  개인 Gemini API Key 등록
+                </label>
+                <div className="relative">
+                  <input
+                    type="password"
+                    value={tempApiKey}
+                    onChange={(e) => setTempApiKey(e.target.value)}
+                    placeholder="AIzaSy... 키를 붙여넣으세요"
+                    className="w-full bg-neutral-50 border border-neutral-200 rounded-2xl px-4 py-3.5 text-xs text-neutral-800 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 font-mono"
+                  />
+                </div>
+                <div className="p-3 bg-neutral-50 rounded-2xl border border-neutral-200 flex items-center justify-between gap-2 text-xs">
+                  <div className="flex items-center gap-1.5 text-neutral-600 truncate font-mono text-[11px]">
+                    <ExternalLink size={12} className="text-indigo-600 shrink-0" />
+                    <span className="truncate">https://aistudio.google.com/app/apikey</span>
+                  </div>
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <button
+                      type="button"
+                      onClick={copyApiKeyPageUrl}
+                      className="px-2.5 py-1 bg-white hover:bg-neutral-100 border border-neutral-200 rounded-lg text-[11px] font-bold text-neutral-700 transition-colors cursor-pointer flex items-center gap-1"
+                    >
+                      {quotaUrlCopied ? <Check size={11} className="text-emerald-600" /> : <Copy size={11} />}
+                      <span>{quotaUrlCopied ? "복사됨" : "링크 복사"}</span>
+                    </button>
+                    <a
+                      href="https://aistudio.google.com/app/apikey"
+                      target="_blank"
+                      rel="noreferrer"
+                      className="px-2.5 py-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-[11px] font-bold transition-colors cursor-pointer flex items-center gap-1"
+                    >
+                      <span>발급 사이트</span>
+                      <ExternalLink size={10} />
+                    </a>
+                  </div>
+                </div>
+                <div className="text-[10px] text-neutral-400">
+                  🔒 등록하신 키는 서버에 저장되지 않고 본인 브라우저(LocalStorage)에만 안전하게 보관됩니다.
+                </div>
+              </div>
+
+              {/* 저장 버튼 */}
+              <div className="space-y-2 pt-2">
+                <button
+                  onClick={() => {
+                    const cleaned = tempApiKey.trim();
+                    if (cleaned) {
+                      localStorage.setItem("user_gemini_api_key", cleaned);
+                      setUserApiKey(cleaned);
+                    } else {
+                      localStorage.removeItem("user_gemini_api_key");
+                      setUserApiKey("");
+                    }
+                    setShowApiKeyModal(false);
+                    if (quotaAlertModal.show) {
+                      setQuotaAlertModal({ show: false, message: "", details: "" });
+                    }
+                  }}
+                  className="w-full py-4 bg-indigo-600 hover:bg-indigo-700 text-white rounded-2xl font-bold text-xs tracking-wide shadow-lg shadow-indigo-500/20 transition-all cursor-pointer"
+                >
+                  설정 저장하기
+                </button>
+                <button
+                  onClick={() => setShowApiKeyModal(false)}
+                  className="w-full py-2.5 text-neutral-400 hover:text-neutral-600 text-xs font-bold transition-colors cursor-pointer"
+                >
+                  닫기
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* 무료 사용량(Quota) 초과 시 친절 안내 모달 */}
+      <AnimatePresence>
+        {quotaAlertModal.show && (
+          <motion.div 
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[110] flex items-center justify-center p-4 sm:p-6 bg-neutral-900/70 backdrop-blur-md"
+            onClick={() => setQuotaAlertModal({ show: false, message: "", details: "" })}
+          >
+            <motion.div 
+              initial={{ scale: 0.95, y: 20 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.95, y: 20 }}
+              className="bg-white rounded-[2.5rem] p-6 sm:p-9 max-w-xl w-full shadow-2xl space-y-6 relative overflow-hidden max-h-[92vh] overflow-y-auto"
+              onClick={e => e.stopPropagation()}
+            >
+              {/* 상단 닫기 버튼 */}
+              <button 
+                onClick={() => setQuotaAlertModal({ show: false, message: "", details: "" })}
+                className="absolute top-6 right-6 text-neutral-400 hover:text-neutral-900 transition-colors p-2 rounded-full hover:bg-neutral-100 cursor-pointer"
+              >
+                <X size={20} />
+              </button>
+
+              {/* 헤더 & 정확한 사용자 요청 문구 */}
+              <div className="space-y-3">
+                <div className="inline-flex items-center gap-2 px-3 py-1 bg-amber-50 border border-amber-200/80 rounded-full text-amber-700 text-[11px] font-black uppercase tracking-widest">
+                  <AlertCircle size={14} /> 일일 무료 사용량 안내
+                </div>
+                <h3 className="text-xl sm:text-2xl font-black text-neutral-900 tracking-tight leading-snug">
+                  하루 할당량이 다 소모되었습니다.<br />
+                  <span className="text-indigo-600">개인 API키를 입력해주세요</span>
+                </h3>
+                <p className="text-neutral-600 text-xs sm:text-sm leading-relaxed">
+                  오늘 기본 제공되는 서버 무료 API의 하루 할당량이 모두 소진되었습니다. 구글에서 <strong>누구나 100% 무료</strong>로 발급받을 수 있는 개인 API 키 코드를 등록하시면 대기 시간 없이 즉시 토론을 무제한으로 계속 이용하실 수 있습니다.
+                </p>
+              </div>
+
+              {/* 1. API 코드 복사/발급 링크 카드 */}
+              <div className="p-4 sm:p-5 bg-indigo-50/60 border border-indigo-100 rounded-3xl space-y-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] font-black text-indigo-900 uppercase tracking-wider flex items-center gap-1.5">
+                    <ExternalLink size={13} className="text-indigo-600" /> Google API Key 발급 링크
+                  </span>
+                  <span className="text-[10px] text-indigo-600 font-bold bg-indigo-100/70 px-2 py-0.5 rounded-full">
+                    100% 무료 · 카드등록 불필요
+                  </span>
+                </div>
+                
+                <div className="flex items-center gap-2 bg-white p-2.5 rounded-2xl border border-indigo-100 text-xs text-neutral-700 font-mono">
+                  <span className="truncate flex-1 select-all text-neutral-600 font-medium text-[11px]">
+                    https://aistudio.google.com/app/apikey
+                  </span>
+                  <button
+                    onClick={copyApiKeyPageUrl}
+                    className="shrink-0 flex items-center gap-1 px-3 py-1.5 bg-neutral-100 hover:bg-neutral-200 text-neutral-700 rounded-xl text-[11px] font-bold transition-all cursor-pointer"
+                  >
+                    {quotaUrlCopied ? <Check size={12} className="text-emerald-600" /> : <Copy size={12} />}
+                    <span>{quotaUrlCopied ? "복사됨!" : "링크 복사"}</span>
+                  </button>
+                  <a
+                    href="https://aistudio.google.com/app/apikey"
+                    target="_blank"
+                    rel="noreferrer"
+                    className="shrink-0 flex items-center gap-1 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-[11px] font-bold transition-all cursor-pointer shadow-sm"
+                  >
+                    <span>사이트 열기</span>
+                    <ExternalLink size={11} />
+                  </a>
+                </div>
+              </div>
+
+              {/* 2. 상세 방법 안내 (4단계 가이드) */}
+              <div className="space-y-2.5">
+                <div className="text-[11px] font-black uppercase tracking-wider text-neutral-400">
+                  📖 개인 API 키 1분 발급 방법 안내
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
+                  <div className="p-3 bg-neutral-50 rounded-2xl border border-neutral-100 space-y-1">
+                    <div className="font-black text-neutral-800 flex items-center gap-1.5 text-[11px]">
+                      <span className="w-5 h-5 rounded-full bg-indigo-600 text-white flex items-center justify-center text-[10px] font-bold">1</span>
+                      발급 페이지 접속
+                    </div>
+                    <p className="text-[11px] text-neutral-500 leading-snug">
+                      위 발급 링크를 클릭하여 Google 계정으로 간편 로그인합니다.
+                    </p>
+                  </div>
+
+                  <div className="p-3 bg-neutral-50 rounded-2xl border border-neutral-100 space-y-1">
+                    <div className="font-black text-neutral-800 flex items-center gap-1.5 text-[11px]">
+                      <span className="w-5 h-5 rounded-full bg-indigo-600 text-white flex items-center justify-center text-[10px] font-bold">2</span>
+                      키 생성 버튼 클릭
+                    </div>
+                    <p className="text-[11px] text-neutral-500 leading-snug">
+                      화면 왼쪽 위의 파란색 <strong>&apos;Create API key&apos;</strong> 버튼을 클릭합니다.
+                    </p>
+                  </div>
+
+                  <div className="p-3 bg-neutral-50 rounded-2xl border border-neutral-100 space-y-1">
+                    <div className="font-black text-neutral-800 flex items-center gap-1.5 text-[11px]">
+                      <span className="w-5 h-5 rounded-full bg-indigo-600 text-white flex items-center justify-center text-[10px] font-bold">3</span>
+                      API 코드 복사
+                    </div>
+                    <p className="text-[11px] text-neutral-500 leading-snug">
+                      생성된 팝업에서 본인의 <strong>API 코드(AIzaSy...)</strong>를 복사합니다.
+                    </p>
+                  </div>
+
+                  <div className="p-3 bg-neutral-50 rounded-2xl border border-neutral-100 space-y-1">
+                    <div className="font-black text-neutral-800 flex items-center gap-1.5 text-[11px]">
+                      <span className="w-5 h-5 rounded-full bg-indigo-600 text-white flex items-center justify-center text-[10px] font-bold">4</span>
+                      아래 입력 후 시작
+                    </div>
+                    <p className="text-[11px] text-neutral-500 leading-snug">
+                      아래 입력창에 붙여넣고 버튼을 누르면 즉시 토론이 시작됩니다.
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              {/* 3. 인라인 API 키 입력창 */}
+              <div className="space-y-2 pt-1">
+                <label className="text-[11px] font-black uppercase tracking-wider text-neutral-600 block">
+                  복사한 개인 API 코드 붙여넣기
+                </label>
+                <div className="relative">
+                  <input
+                    type="password"
+                    value={quotaModalInputKey}
+                    onChange={(e) => setQuotaModalInputKey(e.target.value)}
+                    placeholder="AIzaSy... 복사한 코드를 여기에 붙여넣어 주세요"
+                    className="w-full bg-neutral-50 border border-neutral-200 focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/20 rounded-2xl px-4 py-3.5 text-xs text-neutral-800 font-mono outline-none transition-all"
+                  />
+                </div>
+                <div className="text-[10px] text-neutral-400 flex items-center justify-between">
+                  <span>🔒 입력하신 키는 브라우저 내부(LocalStorage)에만 안전하게 보관됩니다.</span>
+                </div>
+              </div>
+
+              {/* 4. 액션 버튼 */}
+              <div className="space-y-2 pt-2">
+                <button
+                  onClick={() => {
+                    const cleaned = quotaModalInputKey.trim();
+                    if (!cleaned) {
+                      alert("복사한 Gemini API 키 코드를 입력해주세요.");
+                      return;
+                    }
+                    localStorage.setItem("user_gemini_api_key", cleaned);
+                    setUserApiKey(cleaned);
+                    setServerQuotaExhausted(false);
+                    setQuotaAlertModal({ show: false, message: "", details: "" });
+                    // 즉시 토론 진행 재개!
+                    startDebate(cleaned);
+                  }}
+                  className="w-full flex items-center justify-center gap-2 py-4 bg-gradient-to-r from-indigo-600 via-violet-600 to-indigo-600 hover:opacity-95 text-white rounded-2xl font-bold text-xs tracking-wide shadow-xl shadow-indigo-500/25 transition-all cursor-pointer"
+                >
+                  <Key size={15} />
+                  <span>키 저장하고 바로 토론 시작하기</span>
+                </button>
+                <button
+                  onClick={() => setQuotaAlertModal({ show: false, message: "", details: "" })}
+                  className="w-full py-2.5 text-neutral-400 hover:text-neutral-600 text-xs font-bold transition-colors cursor-pointer"
+                >
+                  나중에 하기 / 닫기
                 </button>
               </div>
             </motion.div>
