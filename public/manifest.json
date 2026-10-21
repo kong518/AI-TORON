@@ -1,0 +1,19 @@
+{
+  "name": "AI 토론",
+  "short_name": "AI토론",
+  "description": "AI 페르소나들 간의 치열하고 논리적인 토론 서비스",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#f8f9fa",
+  "theme_color": "#4f46e5",
+  "categories": ["productivity", "education"],
+  "icons": [
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/3665/3665922.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

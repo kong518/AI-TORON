@@ -1,0 +1,6 @@
+{
+  "name": "AI 토론",
+  "description": "설정된 AI 페르소나들이 특정 주제에 대해 치열한 토론을 펼치고 논리력을 분석·판정하는 서비스입니다.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
